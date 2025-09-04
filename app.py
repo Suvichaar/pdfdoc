@@ -19,7 +19,7 @@ st.caption("Upload a PDF → SuvichaarDI (prebuilt-read) extracts text → Downl
 # =========================
 # PRICING / CONSTANTS
 # =========================
-CREDITS_START_BALANCE = 10_000
+CREDITS_START_BALANCE = 30_000
 PRICE_PER_PAGE_CREDITS = 3  # ₹3 == 3 credits
 
 # persistent store file (server-side)
