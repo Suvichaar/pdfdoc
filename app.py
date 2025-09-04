@@ -14,13 +14,16 @@ import streamlit as st
 # =========================
 st.set_page_config(page_title="PDF → DOCX Suvichaars", page_icon="📄", layout="wide")
 st.title("📄 PDF → DOCX with SuvichaarDocument Intelligence")
-st.caption("Upload a PDF → SuvichaarDI (prebuilt-read) extracts text → Download a .docx • Pricing: ₹3 per page (3 credits)")
+st.caption(
+    "Upload a PDF → SuvichaarDI (prebuilt-read) extracts text → Download a .docx • "
+    "Pricing: ₹3 per page (3 credits) • Start balance: 30,000 credits ≈ 10,000 pages"
+)
 
 # =========================
 # PRICING / CONSTANTS
 # =========================
-CREDITS_START_BALANCE = 30_000
-PRICE_PER_PAGE_CREDITS = 3  # ₹3 == 3 credits
+CREDITS_START_BALANCE = 30_000  # 30,000 credits ≈ 10,000 pages at 3 credits/page
+PRICE_PER_PAGE_CREDITS = 3      # ₹3 == 3 credits
 
 # persistent store file (server-side)
 STORE_PATH = Path("./credits_store.json")
@@ -126,6 +129,7 @@ with st.sidebar:
     max_display = max(CREDITS_START_BALANCE, get_balance())
     pct = min(max(get_balance() / float(max_display), 0.0), 1.0)
     st.progress(pct, text=f"Balance: {get_balance()} credits")
+    st.caption("Start pool: 30,000 credits ≈ 10,000 pages")
 
     # Last transaction (pretty card)
     txn = get_last_txn()
@@ -173,7 +177,7 @@ with st.sidebar:
                 # hard reset to defaults
                 st.session_state.store = DEFAULT_STORE.copy()
                 save_store(st.session_state.store)
-                st.success("Wallet reset to 10,000 and history cleared.")
+                st.success("Wallet reset to 30,000 credits (≈ 10,000 pages) and history cleared.")
 
 # =========================
 # SETTINGS (single expander)
@@ -394,5 +398,6 @@ else:
 # =========================
 st.caption(
     "Credits persist across reloads in a server-side JSON store. Only admins can refill using the PIN from st.secrets. "
+    "Start pool: 30,000 credits ≈ 10,000 pages. "
     f"Pricing: {PRICE_PER_PAGE_CREDITS} credits (₹{PRICE_PER_PAGE_CREDITS}) per page."
 )
