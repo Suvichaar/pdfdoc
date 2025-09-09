@@ -49,6 +49,11 @@ S3_PREFIX = get_secret("S3_PREFIX", "media/pdf2docx")  # no leading slash
 ADMIN_EMAIL = get_secret("ADMIN_EMAIL", "admin@gooclaim.com")
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "change_me_now")  # first-run bootstrap
 
+# --- Admin Panel PIN (6 digits) ---
+ADMIN_PANEL_PIN = str(get_secret("ADMIN_PANEL_PIN", "000000")).strip()
+if not re.fullmatch(r"\d{6}", ADMIN_PANEL_PIN):
+    ADMIN_PANEL_PIN = "000000"  # enforce 6-digit format
+
 # =========================
 # SDK IMPORTS
 # =========================
@@ -104,6 +109,8 @@ if "current_user" not in st.session_state:
     st.session_state.current_user = None
 if "auth_view" not in st.session_state:
     st.session_state.auth_view = "login"
+if "admin_panel_unlocked" not in st.session_state:
+    st.session_state.admin_panel_unlocked = False  # gate admin panel with 6-digit PIN
 
 # First-run: ensure admin exists
 if ADMIN_EMAIL not in st.session_state.users_db["users"]:
@@ -274,7 +281,7 @@ def charge_user_for_pages(rec: Dict[str, Any], fid: str, pages: int, filename: s
     return cost
 
 # =========================
-# SIDEBAR: PROFILE + CREDITS + ADMIN
+# SIDEBAR: PROFILE + CREDITS + ADMIN (with 6-digit PIN gate)
 # =========================
 with st.sidebar:
     u = get_user_rec()
@@ -301,7 +308,7 @@ with st.sidebar:
     st.progress(pct, text=f"Balance: {int(u.get('credits',0))} credits")
     st.caption("Pricing: 3 credits (₹3) per page • Set by Admin")
 
-    # Last transaction (optional pretty card)
+    # Last transaction (optional)
     txn = u.get("last_txn")
     if txn:
         st.markdown(
@@ -319,74 +326,88 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-    # Admin panel
+    # Admin panel (only if user is admin) + requires 6-digit PIN
     if u.get("is_admin"):
         with st.expander("🔐 Admin Panel", expanded=False):
-            st.markdown("**Create / Edit User**")
-            a_email = st.text_input("User Email", key="a_email")
-            a_name = st.text_input("Name", key="a_name")
-            a_tenant = st.text_input("Tenant ID", key="a_tenant")
-            a_profile = st.text_input("Profile ID", key="a_profile")
-            a_start = st.number_input("Start Credits", min_value=0, value=DEFAULT_START_CREDITS, step=100, key="a_start")
-            a_credits = st.number_input("Current Credits", min_value=0, value=DEFAULT_START_CREDITS, step=100, key="a_credits")
-            a_temp_pw = st.text_input("Temporary Password (for new/reset)", type="password", key="a_temp")
-
-            if st.button("Save User", key="a_save"):
-                if not a_email:
-                    st.error("Email required.")
-                else:
-                    db = st.session_state.users_db
-                    rec = db["users"].get(a_email, {})
-                    rec.update({
-                        "email": a_email,
-                        "name": a_name or rec.get("name") or "",
-                        "tenant_id": a_tenant or rec.get("tenant_id") or "",
-                        "profile_id": a_profile or rec.get("profile_id") or "",
-                        "is_admin": rec.get("is_admin", False),
-                        "start_credits": int(a_start),
-                        "credits": int(a_credits),
-                        "ledger": rec.get("ledger", []),
-                        "charged_docs": rec.get("charged_docs", {}),
-                        "last_txn": rec.get("last_txn", None),
-                        "last_s3_keys": rec.get("last_s3_keys", []),
-                    })
-                    if a_temp_pw:
-                        rec["temp_pw_hash"] = _set_pw(a_temp_pw)
-                        rec["force_pw_change"] = True
+            if not st.session_state.admin_panel_unlocked:
+                st.info("Enter the 6-digit Admin PIN to unlock the panel.")
+                pin_in = st.text_input("Admin PIN (6 digits)", type="password", max_chars=6, key="admin_pin_input")
+                if st.button("Unlock Admin Panel", key="admin_pin_btn"):
+                    if re.fullmatch(r"\d{6}", str(pin_in or "")) and str(pin_in) == ADMIN_PANEL_PIN:
+                        st.session_state.admin_panel_unlocked = True
+                        st.success("Admin Panel unlocked.")
                     else:
-                        rec["force_pw_change"] = rec.get("force_pw_change", False)
+                        st.error("Invalid PIN. Please try again.")
+            else:
+                # Lock button
+                if st.button("🔒 Lock Admin Panel", key="admin_pin_lock"):
+                    st.session_state.admin_panel_unlocked = False
 
-                    db["users"][a_email] = rec
-                    save_users(db)
-                    st.success("User saved / updated.")
+                st.markdown("**Create / Edit User**")
+                a_email = st.text_input("User Email", key="a_email")
+                a_name = st.text_input("Name", key="a_name")
+                a_tenant = st.text_input("Tenant ID", key="a_tenant")
+                a_profile = st.text_input("Profile ID", key="a_profile")
+                a_start = st.number_input("Start Credits", min_value=0, value=DEFAULT_START_CREDITS, step=100, key="a_start")
+                a_credits = st.number_input("Current Credits", min_value=0, value=DEFAULT_START_CREDITS, step=100, key="a_credits")
+                a_temp_pw = st.text_input("Temporary Password (for new/reset)", type="password", key="a_temp")
 
-            st.markdown("---")
-            st.markdown("**Top-up Credits**")
-            top_email = st.text_input("Email to top-up", key="top_email")
-            top_amt = st.number_input("Amount", min_value=1, value=100, step=50, key="top_amt")
-            if st.button("Top-up", key="top_btn"):
-                db = st.session_state.users_db
-                rec = db["users"].get(top_email)
-                if not rec:
-                    st.error("User not found.")
-                else:
-                    rec["credits"] = int(rec.get("credits", 0)) + int(top_amt)
-                    save_users(db)
-                    st.success(f"Topped up {top_amt} credits.")
+                if st.button("Save User", key="a_save"):
+                    if not a_email:
+                        st.error("Email required.")
+                    else:
+                        db = st.session_state.users_db
+                        rec = db["users"].get(a_email, {})
+                        rec.update({
+                            "email": a_email,
+                            "name": a_name or rec.get("name") or "",
+                            "tenant_id": a_tenant or rec.get("tenant_id") or "",
+                            "profile_id": a_profile or rec.get("profile_id") or "",
+                            "is_admin": rec.get("is_admin", False),
+                            "start_credits": int(a_start),
+                            "credits": int(a_credits),
+                            "ledger": rec.get("ledger", []),
+                            "charged_docs": rec.get("charged_docs", {}),
+                            "last_txn": rec.get("last_txn", None),
+                            "last_s3_keys": rec.get("last_s3_keys", []),
+                        })
+                        if a_temp_pw:
+                            rec["temp_pw_hash"] = _set_pw(a_temp_pw)
+                            rec["force_pw_change"] = True
+                        else:
+                            rec["force_pw_change"] = rec.get("force_pw_change", False)
 
-            st.markdown("---")
-            st.markdown("**Grant/Revoke Admin**")
-            adm_email = st.text_input("Email", key="adm_email")
-            make_admin = st.checkbox("Is Admin?", value=False, key="adm_flag")
-            if st.button("Update Admin Flag", key="adm_btn"):
-                db = st.session_state.users_db
-                rec = db["users"].get(adm_email)
-                if not rec:
-                    st.error("User not found.")
-                else:
-                    rec["is_admin"] = bool(make_admin)
-                    save_users(db)
-                    st.success("Updated.")
+                        db["users"][a_email] = rec
+                        save_users(db)
+                        st.success("User saved / updated.")
+
+                st.markdown("---")
+                st.markdown("**Top-up Credits**")
+                top_email = st.text_input("Email to top-up", key="top_email")
+                top_amt = st.number_input("Amount", min_value=1, value=100, step=50, key="top_amt")
+                if st.button("Top-up", key="top_btn"):
+                    db = st.session_state.users_db
+                    rec = db["users"].get(top_email)
+                    if not rec:
+                        st.error("User not found.")
+                    else:
+                        rec["credits"] = int(rec.get("credits", 0)) + int(top_amt)
+                        save_users(db)
+                        st.success(f"Topped up {top_amt} credits.")
+
+                st.markdown("---")
+                st.markdown("**Grant/Revoke Admin**")
+                adm_email = st.text_input("Email", key="adm_email")
+                make_admin = st.checkbox("Is Admin?", value=False, key="adm_flag")
+                if st.button("Update Admin Flag", key="adm_btn"):
+                    db = st.session_state.users_db
+                    rec = db["users"].get(adm_email)
+                    if not rec:
+                        st.error("User not found.")
+                    else:
+                        rec["is_admin"] = bool(make_admin)
+                        save_users(db)
+                        st.success("Updated.")
 
 # =========================
 # SETTINGS (single expander)
