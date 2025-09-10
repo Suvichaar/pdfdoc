@@ -47,12 +47,12 @@ S3_PREFIX = get_secret("S3_PREFIX", "media/pdf2docx")  # no leading slash
 
 # --- Admin bootstrap ---
 ADMIN_EMAIL = get_secret("ADMIN_EMAIL")
-ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "change_me_now")  # first-run bootstrap
+ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")  # first-run bootstrap
 
 # --- Admin Panel PIN (6 digits) ---
-ADMIN_PANEL_PIN = str(get_secret("ADMIN_PANEL_PIN", "000000")).strip()
+ADMIN_PANEL_PIN = str(get_secret("ADMIN_PANEL_PIN")).strip()
 if not re.fullmatch(r"\d{6}", ADMIN_PANEL_PIN):
-    ADMIN_PANEL_PIN = "000000"  # enforce 6-digit format
+    ADMIN_PANEL_PIN = "011235"  # enforce 6-digit format
 
 # =========================
 # SDK IMPORTS
