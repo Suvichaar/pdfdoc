@@ -189,21 +189,35 @@ def ui_login():
     st.subheader("Login")
     email = st.text_input("Email", key="auth_email")
     pw = st.text_input("Password", type="password", key="auth_pw")
+
     if st.button("Sign in", key="auth_signin_btn", use_container_width=True):
         rec = st.session_state.users_db["users"].get(email)
-        if not rec or _set_pw(pw) != rec["password_hash"]:
+        if not rec:
             st.error("Invalid email or password.")
             return
+
+        # If account flagged for first-time reset, only accept temporary password and redirect to Reset
         if rec.get("force_pw_change"):
-            st.warning("Please reset your password before login.")
-            st.session_state.auth_view = "reset"
-            st.session_state.reset_email_prefill = email
-            return
-        st.session_state.current_user = rec
-        st.success(f"Welcome {rec.get('name') or rec['email']}!")
+            temp_hash = rec.get("temp_pw_hash")
+            if temp_hash and _set_pw(pw) == temp_hash:
+                st.session_state.auth_view = "reset"
+                st.session_state.reset_email_prefill = email
+                st.info("First-time login detected. Please set a new password to continue.")
+                return
+            else:
+                st.error("This account requires a password reset. Use your temporary password to proceed.")
+                return
+
+        # Normal login (no reset required)
+        if _set_pw(pw) == rec.get("password_hash"):
+            st.session_state.current_user = rec
+            st.success(f"Welcome {rec.get('name') or rec['email']}!")
+        else:
+            st.error("Invalid email or password.")
 
 def ui_reset_password():
     st.subheader("Reset Password")
+    st.caption("Use the temporary password you received from Admin once, then set a new password.")
     email = st.text_input("Email", value=st.session_state.get("reset_email_prefill",""), key="reset_email")
     temp_pw = st.text_input("Temporary Password", type="password", key="reset_temp")
     new_pw = st.text_input("New Password", type="password", key="reset_new")
@@ -280,9 +294,6 @@ def charge_user_for_pages(rec: Dict[str, Any], fid: str, pages: int, filename: s
     save_user_rec(rec)
     return cost
 
-# =========================
-# SIDEBAR: PROFILE + CREDITS + ADMIN (with 6-digit PIN gate)
-# =========================
 # =========================
 # SIDEBAR: PROFILE + CREDITS + ADMIN (with 6-digit PIN gate)
 # =========================
@@ -444,7 +455,6 @@ with st.sidebar:
                             st.session_state.current_user = target
 
                         st.success(f"Updated tenant/profile for {sel_email}.")
-
 
 # =========================
 # SETTINGS (single expander)
