@@ -50,9 +50,13 @@ ADMIN_EMAIL = get_secret("ADMIN_EMAIL")
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")  # first-run bootstrap
 
 # --- Admin Panel PIN (6 digits) ---
-ADMIN_PANEL_PIN = str(get_secret("ADMIN_PANEL_PIN")).strip()
+# --- Admin Panel PIN (6 digits) ---
+# Read ONLY from env or secrets; never hard-code a default.
+ADMIN_PANEL_PIN = (os.getenv("ADMIN_PANEL_PIN") or get_secret("ADMIN_PANEL_PIN") or "").strip()
 if not re.fullmatch(r"\d{6}", ADMIN_PANEL_PIN):
-    ADMIN_PANEL_PIN = "011235"  # enforce 6-digit format
+    st.error("ADMIN_PANEL_PIN missing/invalid. Set a 6-digit PIN via env var or .streamlit/secrets.toml and restart.")
+    st.stop()
+
 
 # =========================
 # SDK IMPORTS
