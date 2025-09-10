@@ -46,7 +46,7 @@ S3_BUCKET = get_secret("S3_BUCKET", "suvichaarapp")
 S3_PREFIX = get_secret("S3_PREFIX", "media/pdf2docx")  # no leading slash
 
 # --- Admin bootstrap ---
-ADMIN_EMAIL = get_secret("ADMIN_EMAIL", "admin@gooclaim.com")
+ADMIN_EMAIL = get_secret("ADMIN_EMAIL", "admin@suvichaar.com")
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "change_me_now")  # first-run bootstrap
 
 # --- Admin Panel PIN (6 digits) ---
