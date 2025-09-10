@@ -283,6 +283,9 @@ def charge_user_for_pages(rec: Dict[str, Any], fid: str, pages: int, filename: s
 # =========================
 # SIDEBAR: PROFILE + CREDITS + ADMIN (with 6-digit PIN gate)
 # =========================
+# =========================
+# SIDEBAR: PROFILE + CREDITS + ADMIN (with 6-digit PIN gate)
+# =========================
 with st.sidebar:
     u = get_user_rec()
 
@@ -408,6 +411,40 @@ with st.sidebar:
                         rec["is_admin"] = bool(make_admin)
                         save_users(db)
                         st.success("Updated.")
+
+                # =========================
+                # NEW: Set Tenant/Profile for any user (after PIN unlock)
+                # =========================
+                st.markdown("---")
+                st.markdown("**Set Tenant ID / Profile ID**")
+
+                users_map = st.session_state.users_db.get("users", {})
+                user_emails = sorted(users_map.keys())
+
+                sel_email = st.selectbox("Select user", options=user_emails, key="tenant_profile_sel_email")
+
+                if sel_email:
+                    target = users_map.get(sel_email, {})
+                    cur_tenant  = target.get("tenant_id", "")
+                    cur_profile = target.get("profile_id", "")
+
+                    new_tenant  = st.text_input("Tenant ID",  value=cur_tenant,  key="tenant_profile_new_tenant")
+                    new_profile = st.text_input("Profile ID", value=cur_profile, key="tenant_profile_new_profile")
+
+                    if st.button("Save Tenant/Profile", key="tenant_profile_save_btn"):
+                        target["tenant_id"]  = (new_tenant or "").strip()
+                        target["profile_id"] = (new_profile or "").strip()
+
+                        db = st.session_state.users_db
+                        db["users"][sel_email] = target
+                        save_users(db)
+
+                        # keep session in sync if current user was updated
+                        if st.session_state.current_user["email"] == sel_email:
+                            st.session_state.current_user = target
+
+                        st.success(f"Updated tenant/profile for {sel_email}.")
+
 
 # =========================
 # SETTINGS (single expander)
