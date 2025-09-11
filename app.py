@@ -39,24 +39,24 @@ AZURE_DI_ENDPOINT = get_secret("AZURE_DI_ENDPOINT")
 AZURE_DI_KEY = get_secret("AZURE_DI_KEY")
 
 # --- AWS / S3 (silent uploads) ---
-AWS_REGION = get_secret("AWS_REGION", "ap-south-1")
-AWS_ACCESS_KEY_ID = get_secret("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = get_secret("AWS_SECRET_ACCESS_KEY")
-S3_BUCKET = get_secret("S3_BUCKET", "suvichaarapp")
-S3_PREFIX = get_secret("S3_PREFIX", "media/pdf2docx")  # no leading slash
+AWS_REGION = os.getenv("AWS_REGION") or get_secret("AWS_REGION", "ap-south-1")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID") or get_secret("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY") or get_secret("AWS_SECRET_ACCESS_KEY")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")  # optional, if using temporary creds
+
+S3_BUCKET = os.getenv("S3_BUCKET") or get_secret("S3_BUCKET", "suvichaarapp")
+S3_PREFIX = (os.getenv("S3_PREFIX") or get_secret("S3_PREFIX", "media/pdf2docx")).lstrip("/")
 
 # --- Admin bootstrap ---
-ADMIN_EMAIL = get_secret("ADMIN_EMAIL")
-ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")  # first-run bootstrap
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL") or get_secret("ADMIN_EMAIL")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD") or get_secret("ADMIN_PASSWORD")  # first-run bootstrap
 
-# --- Admin Panel PIN (6 digits) ---
 # --- Admin Panel PIN (6 digits) ---
 # Read ONLY from env or secrets; never hard-code a default.
 ADMIN_PANEL_PIN = (os.getenv("ADMIN_PANEL_PIN") or get_secret("ADMIN_PANEL_PIN") or "").strip()
 if not re.fullmatch(r"\d{6}", ADMIN_PANEL_PIN):
     st.error("ADMIN_PANEL_PIN missing/invalid. Set a 6-digit PIN via env var or .streamlit/secrets.toml and restart.")
     st.stop()
-
 
 # =========================
 # SDK IMPORTS
@@ -117,6 +117,10 @@ if "admin_panel_unlocked" not in st.session_state:
     st.session_state.admin_panel_unlocked = False  # gate admin panel with 6-digit PIN
 
 # First-run: ensure admin exists
+if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+    st.error("ADMIN_EMAIL / ADMIN_PASSWORD not set in env or secrets.")
+    st.stop()
+
 if ADMIN_EMAIL not in st.session_state.users_db["users"]:
     st.session_state.users_db["users"][ADMIN_EMAIL] = {
         "email": ADMIN_EMAIL,
@@ -139,6 +143,7 @@ if ADMIN_EMAIL not in st.session_state.users_db["users"]:
 # S3 HELPERS (silent uploads)
 # =========================
 import boto3
+from botocore.exceptions import ClientError
 
 def _sanitize_filename(name: str) -> str:
     base = name.strip().replace(" ", "_")
@@ -146,7 +151,16 @@ def _sanitize_filename(name: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def _get_s3_client():
+    # Let boto3 fall back to environment/instance role if keys not provided
     if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        if AWS_SESSION_TOKEN:
+            return boto3.client(
+                "s3",
+                region_name=AWS_REGION,
+                aws_access_key_id=AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+                aws_session_token=AWS_SESSION_TOKEN,
+            )
         return boto3.client(
             "s3",
             region_name=AWS_REGION,
@@ -163,7 +177,9 @@ def _build_object_key(prefix: str, kind: str, tenant_id: str, email: str, fid: s
 
 def _put_bytes_to_s3(key: str, data: bytes, content_type: str) -> None:
     extra = {"ContentType": content_type}
-    # extra["ServerSideEncryption"] = "AES256"  # uncomment if you want SSE-S3 explicitly
+    # If your bucket policy requires SSE, uncomment one of these:
+    # extra["ServerSideEncryption"] = "AES256"
+    # extra["ServerSideEncryption"] = "aws:kms"; extra["SSEKMSKeyId"] = "<your-kms-key-arn>"
     _get_s3_client().put_object(Bucket=S3_BUCKET, Key=key, Body=data, **extra)
 
 def silent_upload_pdf(fid: str, filename: str, pdf_bytes: bytes, tenant_id: str, email: str):
@@ -174,7 +190,8 @@ def silent_upload_pdf(fid: str, filename: str, pdf_bytes: bytes, tenant_id: str,
         (rec.setdefault("last_s3_keys", [])).append({"type": "pdf", "key": key, "ts": datetime.now().isoformat()})
         save_user_rec(rec)
     except Exception:
-        pass  # silent by design
+        # silent by design; avoid breaking the main flow if S3 is down
+        pass
 
 def silent_upload_docx(fid: str, filename: str, docx_bytes: bytes, tenant_id: str, email: str):
     try:
@@ -184,7 +201,30 @@ def silent_upload_docx(fid: str, filename: str, docx_bytes: bytes, tenant_id: st
         (rec.setdefault("last_s3_keys", [])).append({"type": "docx", "key": key, "ts": datetime.now().isoformat()})
         save_user_rec(rec)
     except Exception:
-        pass  # silent by design
+        # silent by design; avoid breaking the main flow if S3 is down
+        pass
+
+def run_s3_health_check():
+    try:
+        client = _get_s3_client()
+        loc = client.get_bucket_location(Bucket=S3_BUCKET).get("LocationConstraint") or "us-east-1"
+        st.info(f"S3 bucket location: {loc}")
+
+        test_key = f"{(S3_PREFIX or 'media/pdf2docx').rstrip('/')}/healthcheck/{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt"
+        client.put_object(Bucket=S3_BUCKET, Key=test_key, Body=b"ok", ContentType="text/plain")
+        st.success(f"Put OK → {test_key}")
+
+        obj = client.get_object(Bucket=S3_BUCKET, Key=test_key)
+        data = obj["Body"].read()
+        st.success(f"Get OK ({len(data)} bytes)")
+
+        client.delete_object(Bucket=S3_BUCKET, Key=test_key)
+        st.success("Delete OK")
+    except ClientError as e:
+        err = e.response.get("Error", {})
+        st.error(f"S3 ClientError: {err.get('Code')} — {err.get('Message')}")
+    except Exception as e:
+        st.error(f"S3 health check failed: {e}")
 
 # =========================
 # AUTH UI
@@ -428,37 +468,38 @@ with st.sidebar:
                         st.success("Updated.")
 
                 # =========================
-                # NEW: Set Tenant/Profile for any user (after PIN unlock)
+                # Set Tenant/Profile for any user
                 # =========================
                 st.markdown("---")
                 st.markdown("**Set Tenant ID / Profile ID**")
-
                 users_map = st.session_state.users_db.get("users", {})
                 user_emails = sorted(users_map.keys())
-
                 sel_email = st.selectbox("Select user", options=user_emails, key="tenant_profile_sel_email")
 
                 if sel_email:
                     target = users_map.get(sel_email, {})
                     cur_tenant  = target.get("tenant_id", "")
                     cur_profile = target.get("profile_id", "")
-
                     new_tenant  = st.text_input("Tenant ID",  value=cur_tenant,  key="tenant_profile_new_tenant")
                     new_profile = st.text_input("Profile ID", value=cur_profile, key="tenant_profile_new_profile")
 
                     if st.button("Save Tenant/Profile", key="tenant_profile_save_btn"):
                         target["tenant_id"]  = (new_tenant or "").strip()
                         target["profile_id"] = (new_profile or "").strip()
-
                         db = st.session_state.users_db
                         db["users"][sel_email] = target
                         save_users(db)
-
-                        # keep session in sync if current user was updated
                         if st.session_state.current_user["email"] == sel_email:
                             st.session_state.current_user = target
-
                         st.success(f"Updated tenant/profile for {sel_email}.")
+
+                # =========================
+                # S3 Health Check (no ACLs)
+                # =========================
+                st.markdown("---")
+                st.markdown("**S3 Health Check**")
+                if st.button("Run S3 Health Check", key="s3_health_btn"):
+                    run_s3_health_check()
 
 # =========================
 # SETTINGS (single expander)
