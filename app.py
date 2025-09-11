@@ -140,7 +140,7 @@ if ADMIN_EMAIL not in st.session_state.users_db["users"]:
     save_users(st.session_state.users_db)
 
 # =========================
-# S3 HELPERS (silent uploads)
+# S3 HELPERS (silent uploads) — no ACLs
 # =========================
 import boto3
 from botocore.exceptions import ClientError
@@ -149,25 +149,27 @@ def _sanitize_filename(name: str) -> str:
     base = name.strip().replace(" ", "_")
     return re.sub(r"[^A-Za-z0-9._-]+", "", base) or "file"
 
+def _have_static_creds() -> bool:
+    return bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)
+
 @st.cache_resource(show_spinner=False)
-def _get_s3_client():
-    # Let boto3 fall back to environment/instance role if keys not provided
-    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
-        if AWS_SESSION_TOKEN:
-            return boto3.client(
-                "s3",
-                region_name=AWS_REGION,
-                aws_access_key_id=AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                aws_session_token=AWS_SESSION_TOKEN,
-            )
-        return boto3.client(
-            "s3",
-            region_name=AWS_REGION,
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+def _get_s3_client(_region: str, _ak: Optional[str], _sk: Optional[str], _st: Optional[str]):
+    """
+    Build an S3 client bound to the provided credentials/region.
+    Because these are function arguments, Streamlit will rebuild the client
+    whenever any of them change (so we don't keep a bad cached client).
+    """
+    if _ak and _sk:
+        session = boto3.session.Session(
+            aws_access_key_id=_ak,
+            aws_secret_access_key=_sk,
+            aws_session_token=_st,
+            region_name=_region,
         )
-    return boto3.client("s3", region_name=AWS_REGION)
+    else:
+        # Falls back to instance/role creds if available
+        session = boto3.session.Session(region_name=_region)
+    return session.client("s3")
 
 def _build_object_key(prefix: str, kind: str, tenant_id: str, email: str, fid: str, filename: str, ext: str) -> str:
     safe = _sanitize_filename(filename.rsplit(".", 1)[0])
@@ -177,10 +179,11 @@ def _build_object_key(prefix: str, kind: str, tenant_id: str, email: str, fid: s
 
 def _put_bytes_to_s3(key: str, data: bytes, content_type: str) -> None:
     extra = {"ContentType": content_type}
-    # If your bucket policy requires SSE, uncomment one of these:
+    # If your bucket requires SSE, uncomment one of these:
     # extra["ServerSideEncryption"] = "AES256"
     # extra["ServerSideEncryption"] = "aws:kms"; extra["SSEKMSKeyId"] = "<your-kms-key-arn>"
-    _get_s3_client().put_object(Bucket=S3_BUCKET, Key=key, Body=data, **extra)
+    client = _get_s3_client(AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+    client.put_object(Bucket=S3_BUCKET, Key=key, Body=data, **extra)
 
 def silent_upload_pdf(fid: str, filename: str, pdf_bytes: bytes, tenant_id: str, email: str):
     try:
@@ -206,9 +209,13 @@ def silent_upload_docx(fid: str, filename: str, docx_bytes: bytes, tenant_id: st
 
 def run_s3_health_check():
     try:
-        client = _get_s3_client()
+        client = _get_s3_client(AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+
+        source = "static keys" if _have_static_creds() else "instance/role"
+        st.info(f"Using AWS credentials from: {source}")
+
         loc = client.get_bucket_location(Bucket=S3_BUCKET).get("LocationConstraint") or "us-east-1"
-        st.info(f"S3 bucket location: {loc}")
+        st.success(f"S3 bucket location: {loc}")
 
         test_key = f"{(S3_PREFIX or 'media/pdf2docx').rstrip('/')}/healthcheck/{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt"
         client.put_object(Bucket=S3_BUCKET, Key=test_key, Body=b"ok", ContentType="text/plain")
@@ -331,9 +338,10 @@ def charge_user_for_pages(rec: Dict[str, Any], fid: str, pages: int, filename: s
         raise RuntimeError(f"Insufficient credits: need {cost}, have {rec.get('credits',0)}.")
 
     rec["credits"] = int(rec.get("credits", 0)) - cost
-    txn = {"file": filename, "pages": pages, "cost": cost, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    txn = {"file": filename, "pages": pages, "cost": cost, "ts": ts}
     rec["last_txn"] = txn
-    (rec.setdefault("ledger", [])).append({"file": filename, "pages": pages, "credits": cost, "ts": txn["ts"]})
+    (rec.setdefault("ledger", [])).append({"file": filename, "pages": pages, "credits": cost, "ts": ts})
     charged_docs[fid] = txn
     save_user_rec(rec)
     return cost
