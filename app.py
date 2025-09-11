@@ -4,6 +4,7 @@ import json
 import re
 import base64
 import hashlib
+import tempfile
 from typing import Optional, Any, Dict
 from datetime import datetime
 from pathlib import Path
@@ -75,9 +76,17 @@ from docx import Document
 from docx.shared import Pt
 
 # =========================
-# USERS STORE (auth + page wallet)
+# USERS STORE (auth + page wallet) — WRITABLE PATH FIX
 # =========================
-USERS_STORE_PATH = Path("./users_store.json")
+# Prefer an explicit file path if provided, else a writable app dir under /tmp (or platform tmp).
+USERS_STORE_PATH = Path(
+    os.getenv("USERS_STORE_PATH", "")
+    or (Path(os.getenv("USERS_STORE_DIR", Path(tempfile.gettempdir()) / "suvichaar_pdfdoc")) / "users_store.json")
+)
+
+def _ensure_store_parent() -> None:
+    USERS_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 APP_SALT = b"SuvichaarDI_v1"  # app-level salt for PBKDF2
 
 def _hash_pw(password: str, salt: bytes) -> str:
@@ -90,19 +99,25 @@ def _set_pw(password: str) -> str:
 DEFAULT_USERS_DB = {"users": {}}  # email -> record
 
 def load_users() -> Dict[str, Any]:
+    _ensure_store_parent()
+    # If file missing, return default DB.
     if USERS_STORE_PATH.exists():
         try:
             with open(USERS_STORE_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
+            # Corrupt/unreadable: fall back to default
             return DEFAULT_USERS_DB.copy()
     return DEFAULT_USERS_DB.copy()
 
 def save_users(data: Dict[str, Any]) -> None:
-    tmp = USERS_STORE_PATH.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
+    _ensure_store_parent()
+    # Write temp file in the SAME directory (so os.replace is atomic and permitted)
+    tmp_path = USERS_STORE_PATH.with_suffix(USERS_STORE_PATH.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, USERS_STORE_PATH)
+    # Atomic replace
+    os.replace(tmp_path, USERS_STORE_PATH)
 
 # session bootstrap
 if "users_db" not in st.session_state:
@@ -449,7 +464,6 @@ with st.sidebar:
                     else:
                         db = st.session_state.users_db
                         rec = db["users"].get(a_email, {})
-                        # migrate old record first (if any), then update
                         rec = _migrate_to_pages_model(rec or {})
                         rec.update({
                             "email": a_email,
@@ -724,6 +738,7 @@ else:
 # FOOTER
 # =========================
 st.caption(
-    "Per-user page balances persist across reloads (stored server-side). Admin creates users, sets tenant/profile & pages, "
-    "and can top-up anytime. Each extracted page deducts 1 page from your balance."
+    f"User DB: {USERS_STORE_PATH} • Per-user page balances persist across reloads. "
+    "Admin creates users, sets tenant/profile & pages, and can top-up anytime. "
+    "Each extracted page deducts 1 page from your balance."
 )
