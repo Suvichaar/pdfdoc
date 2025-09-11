@@ -17,14 +17,13 @@ st.set_page_config(page_title="PDF → DOCX Suvichaars", page_icon="📄", layou
 st.title("📄 PDF → DOCX with Suvichaar Document Intelligence")
 st.caption(
     "Upload a PDF → SuvichaarDI (prebuilt-read) extracts text → Download a .docx • "
-    "Pricing: ₹3 per page (3 credits) • Per-user credits set by Admin (no reset on reload)"
+    "Each PDF page deducts 1 page from your balance • Default balance: 10,000 pages (admin can top-up)"
 )
 
 # =========================
-# PRICING / CONSTANTS
+# PAGE BALANCE MODEL
 # =========================
-PRICE_PER_PAGE_CREDITS = 3  # ₹3 == 3 credits
-DEFAULT_START_CREDITS = 30_000
+DEFAULT_START_PAGES = 10_000  # per-user starting page allowance
 
 # =========================
 # SECRETS / CONFIG
@@ -42,7 +41,7 @@ AZURE_DI_KEY = get_secret("AZURE_DI_KEY")
 AWS_REGION = os.getenv("AWS_REGION") or get_secret("AWS_REGION", "ap-south-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID") or get_secret("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY") or get_secret("AWS_SECRET_ACCESS_KEY")
-AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")  # optional, if using temporary creds
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")  # optional, for temporary creds
 
 S3_BUCKET = os.getenv("S3_BUCKET") or get_secret("S3_BUCKET", "suvichaarapp")
 S3_PREFIX = (os.getenv("S3_PREFIX") or get_secret("S3_PREFIX", "media/pdf2docx")).lstrip("/")
@@ -52,7 +51,6 @@ ADMIN_EMAIL = os.getenv("ADMIN_EMAIL") or get_secret("ADMIN_EMAIL")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD") or get_secret("ADMIN_PASSWORD")  # first-run bootstrap
 
 # --- Admin Panel PIN (6 digits) ---
-# Read ONLY from env or secrets; never hard-code a default.
 ADMIN_PANEL_PIN = (os.getenv("ADMIN_PANEL_PIN") or get_secret("ADMIN_PANEL_PIN") or "").strip()
 if not re.fullmatch(r"\d{6}", ADMIN_PANEL_PIN):
     st.error("ADMIN_PANEL_PIN missing/invalid. Set a 6-digit PIN via env var or .streamlit/secrets.toml and restart.")
@@ -77,7 +75,7 @@ from docx import Document
 from docx.shared import Pt
 
 # =========================
-# USERS STORE (auth + wallet)
+# USERS STORE (auth + page wallet)
 # =========================
 USERS_STORE_PATH = Path("./users_store.json")
 APP_SALT = b"SuvichaarDI_v1"  # app-level salt for PBKDF2
@@ -121,8 +119,24 @@ if not ADMIN_EMAIL or not ADMIN_PASSWORD:
     st.error("ADMIN_EMAIL / ADMIN_PASSWORD not set in env or secrets.")
     st.stop()
 
+def _migrate_to_pages_model(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Back-compat: if an old record has credits fields, convert to the new pages model.
+    - start_pages <- start_credits or DEFAULT_START_PAGES
+    - remaining_pages <- credits or start_pages
+    """
+    if "start_pages" not in rec and "start_credits" in rec:
+        rec["start_pages"] = int(rec.get("start_credits", DEFAULT_START_PAGES))
+    if "remaining_pages" not in rec and "credits" in rec:
+        rec["remaining_pages"] = int(rec.get("credits", rec.get("start_pages", DEFAULT_START_PAGES)))
+    if "start_pages" not in rec:
+        rec["start_pages"] = DEFAULT_START_PAGES
+    if "remaining_pages" not in rec:
+        rec["remaining_pages"] = rec.get("start_pages", DEFAULT_START_PAGES)
+    return rec
+
 if ADMIN_EMAIL not in st.session_state.users_db["users"]:
-    st.session_state.users_db["users"][ADMIN_EMAIL] = {
+    st.session_state.users_db["users"][ADMIN_EMAIL] = _migrate_to_pages_model({
         "email": ADMIN_EMAIL,
         "name": "Admin",
         "tenant_id": "default-tenant",
@@ -130,13 +144,18 @@ if ADMIN_EMAIL not in st.session_state.users_db["users"]:
         "password_hash": _set_pw(ADMIN_PASSWORD),
         "force_pw_change": False,
         "is_admin": True,
-        "start_credits": DEFAULT_START_CREDITS,
-        "credits": DEFAULT_START_CREDITS,
-        "ledger": [],                # [{file, pages, credits, ts}]
+        "start_pages": DEFAULT_START_PAGES,
+        "remaining_pages": DEFAULT_START_PAGES,
+        "ledger": [],                # [{file, pages, ts}]
         "charged_docs": {},          # file_hash -> txn
-        "last_txn": None,            # {file, pages, cost, ts}
+        "last_txn": None,            # {file, pages, ts}
         "last_s3_keys": [],          # [{type, key, ts}]
-    }
+    })
+    save_users(st.session_state.users_db)
+else:
+    # migrate existing admin record if needed
+    admin_rec = st.session_state.users_db["users"][ADMIN_EMAIL]
+    st.session_state.users_db["users"][ADMIN_EMAIL] = _migrate_to_pages_model(admin_rec)
     save_users(st.session_state.users_db)
 
 # =========================
@@ -313,7 +332,13 @@ if st.session_state.current_user is None:
 # PER-USER HELPERS
 # =========================
 def get_user_rec() -> Dict[str, Any]:
-    return st.session_state.current_user
+    # ensure current record has pages model fields
+    rec = st.session_state.current_user
+    rec = _migrate_to_pages_model(rec)
+    st.session_state.current_user = rec
+    # also save back to disk (migrate)
+    save_user_rec(rec)
+    return rec
 
 def save_user_rec(rec: Dict[str, Any]) -> None:
     db = st.session_state.users_db
@@ -324,30 +349,31 @@ def save_user_rec(rec: Dict[str, Any]) -> None:
 def file_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-def charge_user_for_pages(rec: Dict[str, Any], fid: str, pages: int, filename: str) -> int:
-    """Deduct credits once per user+file_hash; persist to ledger & last_txn."""
+def debit_user_pages(rec: Dict[str, Any], fid: str, pages: int, filename: str) -> int:
+    """
+    Deduct page balance once per user+file_hash; persist to ledger & last_txn.
+    Returns number of pages debited (0 if already billed for this file).
+    """
     pages = max(1, int(pages))
-    cost = pages * PRICE_PER_PAGE_CREDITS
-
     charged_docs = rec.setdefault("charged_docs", {})
     if fid in charged_docs:
-        # Already billed for this file hash
-        return 0
+        return 0  # already debited for this file hash
 
-    if int(rec.get("credits", 0)) < cost:
-        raise RuntimeError(f"Insufficient credits: need {cost}, have {rec.get('credits',0)}.")
+    remaining = int(rec.get("remaining_pages", 0))
+    if remaining < pages:
+        raise RuntimeError(f"Insufficient page balance: need {pages}, have {remaining}.")
 
-    rec["credits"] = int(rec.get("credits", 0)) - cost
+    rec["remaining_pages"] = remaining - pages
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    txn = {"file": filename, "pages": pages, "cost": cost, "ts": ts}
+    txn = {"file": filename, "pages": pages, "ts": ts}
     rec["last_txn"] = txn
-    (rec.setdefault("ledger", [])).append({"file": filename, "pages": pages, "credits": cost, "ts": ts})
+    (rec.setdefault("ledger", [])).append({"file": filename, "pages": pages, "ts": ts})
     charged_docs[fid] = txn
     save_user_rec(rec)
-    return cost
+    return pages
 
 # =========================
-# SIDEBAR: PROFILE + CREDITS + ADMIN (with 6-digit PIN gate)
+# SIDEBAR: PROFILE + PAGE BALANCE + ADMIN (with 6-digit PIN gate)
 # =========================
 with st.sidebar:
     u = get_user_rec()
@@ -367,12 +393,12 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    # Credits meter
-    st.subheader("💳 Credits")
-    start_cap = max(int(u.get("start_credits", DEFAULT_START_CREDITS)), int(u.get("credits", 0)))
-    pct = max(0.0, min(float(u.get("credits", 0)) / float(start_cap or 1), 1.0))
-    st.progress(pct, text=f"Balance: {int(u.get('credits',0))} credits")
-    st.caption("Pricing: 3 credits (₹3) per page • Set by Admin")
+    # Page balance meter
+    st.subheader("📄 Page Balance")
+    start_cap = max(int(u.get("start_pages", DEFAULT_START_PAGES)), int(u.get("remaining_pages", 0)))
+    pct = max(0.0, min(float(u.get("remaining_pages", 0)) / float(start_cap or 1), 1.0))
+    st.progress(pct, text=f"Pages remaining: {int(u.get('remaining_pages', 0))}")
+    st.caption("Each extracted page deducts 1 page from your balance.")
 
     # Last transaction (optional)
     txn = u.get("last_txn")
@@ -383,8 +409,7 @@ with st.sidebar:
               <div style="font-weight:600;color:#1f4396;margin-bottom:6px;">🧾 Last Transaction</div>
               <div style="font-size:13px;line-height:1.4;">
                 <div><b>File:</b> {txn['file']}</div>
-                <div><b>Pages:</b> {txn['pages']}</div>
-                <div><b>Credits:</b> {txn['cost']} (₹{txn['cost']})</div>
+                <div><b>Pages Debited:</b> {txn['pages']}</div>
                 <div style="color:#666;"><b>Time:</b> {txn.get('ts','')}</div>
               </div>
             </div>
@@ -414,8 +439,8 @@ with st.sidebar:
                 a_name = st.text_input("Name", key="a_name")
                 a_tenant = st.text_input("Tenant ID", key="a_tenant")
                 a_profile = st.text_input("Profile ID", key="a_profile")
-                a_start = st.number_input("Start Credits", min_value=0, value=DEFAULT_START_CREDITS, step=100, key="a_start")
-                a_credits = st.number_input("Current Credits", min_value=0, value=DEFAULT_START_CREDITS, step=100, key="a_credits")
+                a_start_pages = st.number_input("Start Pages", min_value=0, value=DEFAULT_START_PAGES, step=100, key="a_start_pages")
+                a_pages_now = st.number_input("Current Pages (remaining)", min_value=0, value=DEFAULT_START_PAGES, step=100, key="a_pages_now")
                 a_temp_pw = st.text_input("Temporary Password (for new/reset)", type="password", key="a_temp")
 
                 if st.button("Save User", key="a_save"):
@@ -424,14 +449,16 @@ with st.sidebar:
                     else:
                         db = st.session_state.users_db
                         rec = db["users"].get(a_email, {})
+                        # migrate old record first (if any), then update
+                        rec = _migrate_to_pages_model(rec or {})
                         rec.update({
                             "email": a_email,
                             "name": a_name or rec.get("name") or "",
                             "tenant_id": a_tenant or rec.get("tenant_id") or "",
                             "profile_id": a_profile or rec.get("profile_id") or "",
                             "is_admin": rec.get("is_admin", False),
-                            "start_credits": int(a_start),
-                            "credits": int(a_credits),
+                            "start_pages": int(a_start_pages),
+                            "remaining_pages": int(a_pages_now),
                             "ledger": rec.get("ledger", []),
                             "charged_docs": rec.get("charged_docs", {}),
                             "last_txn": rec.get("last_txn", None),
@@ -448,18 +475,19 @@ with st.sidebar:
                         st.success("User saved / updated.")
 
                 st.markdown("---")
-                st.markdown("**Top-up Credits**")
+                st.markdown("**Top-up Pages**")
                 top_email = st.text_input("Email to top-up", key="top_email")
-                top_amt = st.number_input("Amount", min_value=1, value=100, step=50, key="top_amt")
+                add_pages = st.number_input("Pages to add", min_value=1, value=100, step=50, key="top_pages")
                 if st.button("Top-up", key="top_btn"):
                     db = st.session_state.users_db
                     rec = db["users"].get(top_email)
                     if not rec:
                         st.error("User not found.")
                     else:
-                        rec["credits"] = int(rec.get("credits", 0)) + int(top_amt)
+                        rec = _migrate_to_pages_model(rec)
+                        rec["remaining_pages"] = int(rec.get("remaining_pages", 0)) + int(add_pages)
                         save_users(db)
-                        st.success(f"Topped up {top_amt} credits.")
+                        st.success(f"Added {add_pages} pages to {top_email}.")
 
                 st.markdown("---")
                 st.markdown("**Grant/Revoke Admin**")
@@ -485,7 +513,7 @@ with st.sidebar:
                 sel_email = st.selectbox("Select user", options=user_emails, key="tenant_profile_sel_email")
 
                 if sel_email:
-                    target = users_map.get(sel_email, {})
+                    target = _migrate_to_pages_model(users_map.get(sel_email, {}))
                     cur_tenant  = target.get("tenant_id", "")
                     cur_profile = target.get("profile_id", "")
                     new_tenant  = st.text_input("Tenant ID",  value=cur_tenant,  key="tenant_profile_new_tenant")
@@ -657,11 +685,11 @@ if uploaded is not None:
             pages = 1
         st.success(f"Extracted text from **{pages} page(s)**.")
 
-        # Billing (once per user+file hash)
+        # Page debit (once per user+file hash)
         try:
-            charged = charge_user_for_pages(u, fid, pages, uploaded.name)
-            if charged > 0:
-                st.toast(f"Charged {charged} credits for {pages} page(s).", icon="✅")
+            debited = debit_user_pages(u, fid, pages, uploaded.name)
+            if debited > 0:
+                st.toast(f"Debited {debited} page(s) from your balance.", icon="✅")
         except RuntimeError as e:
             st.error(str(e))
             st.stop()
@@ -696,6 +724,6 @@ else:
 # FOOTER
 # =========================
 st.caption(
-    "Per-user credits persist across reloads (stored server-side). Admin creates users, sets tenant/profile & credits, "
-    f"and can top-up anytime. Pricing: {PRICE_PER_PAGE_CREDITS} credits (₹{PRICE_PER_PAGE_CREDITS}) per page."
+    "Per-user page balances persist across reloads (stored server-side). Admin creates users, sets tenant/profile & pages, "
+    "and can top-up anytime. Each extracted page deducts 1 page from your balance."
 )
