@@ -712,7 +712,7 @@ else:
 # FOOTER
 # =========================
 st.caption(
-    f"User DB: {USERS_STORE_PATH} • Per-user page balances persist across reloads. "
-    "Admin creates users, sets tenant/profile & pages, and can top-up anytime. "
-    "Each extracted page deducts 1 page from your balance."
+    "• Per-user page balances persist across reloads. "
+    "• Admin creates users, sets tenant/profile & pages, and can top-up anytime. "
+    "• Each extracted page deducts 1 page from your balance."
 )
