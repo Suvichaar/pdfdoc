@@ -19,22 +19,7 @@ from docx.shared import Pt
 # Hide Streamlit header and footer
 # Hide Streamlit header and footer
 # Must come after st.set_page_config(...)
-HIDE_UI = """
-<style>
-/* Header, footer, toolbar */
-[data-testid="stHeader"] {display: none !important;}
-[data-testid="stFooter"] {display: none !important;}
-[data-testid="stToolbar"] {display: none !important;}
-[data-testid="stDecoration"] {display: none !important;}
-[data-testid="stStatusWidget"] {display: none !important;}
 
-/* "Hosted with Streamlit" / viewer badge (bottom-right on Cloud/self-host) */
-a[class^="viewerBadge_link"] {display: none !important;}
-div[class^="viewerBadge_container"] {display: none !important;}
-a[href^="https://streamlit.io/cloud"] {display: none !important;}
-</style>
-"""
-st.markdown(HIDE_UI, unsafe_allow_html=True)
 
 # =========================
 # PAGE SETUP
