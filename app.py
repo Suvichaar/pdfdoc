@@ -10,6 +10,10 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+import boto3
+from botocore.exceptions import ClientError
+from docx import Document
+from docx.shared import Pt
 
 # =========================
 # PAGE SETUP
@@ -58,7 +62,7 @@ if not re.fullmatch(r"\d{6}", ADMIN_PANEL_PIN):
     st.stop()
 
 # =========================
-# SDK IMPORTS
+# SDK IMPORTS (Azure DI)
 # =========================
 try:
     from azure.ai.documentintelligence import DocumentIntelligenceClient
@@ -72,13 +76,9 @@ try:
 except Exception:
     AnalyzeDocumentRequest = None  # type: ignore
 
-from docx import Document
-from docx.shared import Pt
-
 # =========================
 # USERS STORE (auth + page wallet) — WRITABLE PATH FIX
 # =========================
-# Prefer an explicit file path if provided, else a writable app dir under /tmp (or platform tmp).
 USERS_STORE_PATH = Path(
     os.getenv("USERS_STORE_PATH", "")
     or (Path(os.getenv("USERS_STORE_DIR", Path(tempfile.gettempdir()) / "suvichaar_pdfdoc")) / "users_store.json")
@@ -100,26 +100,24 @@ DEFAULT_USERS_DB = {"users": {}}  # email -> record
 
 def load_users() -> Dict[str, Any]:
     _ensure_store_parent()
-    # If file missing, return default DB.
     if USERS_STORE_PATH.exists():
         try:
             with open(USERS_STORE_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            # Corrupt/unreadable: fall back to default
             return DEFAULT_USERS_DB.copy()
     return DEFAULT_USERS_DB.copy()
 
 def save_users(data: Dict[str, Any]) -> None:
     _ensure_store_parent()
-    # Write temp file in the SAME directory (so os.replace is atomic and permitted)
     tmp_path = USERS_STORE_PATH.with_suffix(USERS_STORE_PATH.suffix + ".tmp")
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    # Atomic replace
     os.replace(tmp_path, USERS_STORE_PATH)
 
-# session bootstrap
+# =========================
+# SESSION BOOTSTRAP
+# =========================
 if "users_db" not in st.session_state:
     st.session_state.users_db = load_users()
 if "current_user" not in st.session_state:
@@ -127,7 +125,7 @@ if "current_user" not in st.session_state:
 if "auth_view" not in st.session_state:
     st.session_state.auth_view = "login"
 if "admin_panel_unlocked" not in st.session_state:
-    st.session_state.admin_panel_unlocked = False  # gate admin panel with 6-digit PIN
+    st.session_state.admin_panel_unlocked = False
 
 # First-run: ensure admin exists
 if not ADMIN_EMAIL or not ADMIN_PASSWORD:
@@ -137,8 +135,6 @@ if not ADMIN_EMAIL or not ADMIN_PASSWORD:
 def _migrate_to_pages_model(rec: Dict[str, Any]) -> Dict[str, Any]:
     """
     Back-compat: if an old record has credits fields, convert to the new pages model.
-    - start_pages <- start_credits or DEFAULT_START_PAGES
-    - remaining_pages <- credits or start_pages
     """
     if "start_pages" not in rec and "start_credits" in rec:
         rec["start_pages"] = int(rec.get("start_credits", DEFAULT_START_PAGES))
@@ -161,14 +157,13 @@ if ADMIN_EMAIL not in st.session_state.users_db["users"]:
         "is_admin": True,
         "start_pages": DEFAULT_START_PAGES,
         "remaining_pages": DEFAULT_START_PAGES,
-        "ledger": [],                # [{file, pages, ts}]
-        "charged_docs": {},          # file_hash -> txn
-        "last_txn": None,            # {file, pages, ts}
-        "last_s3_keys": [],          # [{type, key, ts}]
+        "ledger": [],
+        "charged_docs": {},
+        "last_txn": None,
+        "last_s3_keys": [],
     })
     save_users(st.session_state.users_db)
 else:
-    # migrate existing admin record if needed
     admin_rec = st.session_state.users_db["users"][ADMIN_EMAIL]
     st.session_state.users_db["users"][ADMIN_EMAIL] = _migrate_to_pages_model(admin_rec)
     save_users(st.session_state.users_db)
@@ -176,9 +171,6 @@ else:
 # =========================
 # S3 HELPERS (silent uploads) — no ACLs
 # =========================
-import boto3
-from botocore.exceptions import ClientError
-
 def _sanitize_filename(name: str) -> str:
     base = name.strip().replace(" ", "_")
     return re.sub(r"[^A-Za-z0-9._-]+", "", base) or "file"
@@ -188,11 +180,6 @@ def _have_static_creds() -> bool:
 
 @st.cache_resource(show_spinner=False)
 def _get_s3_client(_region: str, _ak: Optional[str], _sk: Optional[str], _st: Optional[str]):
-    """
-    Build an S3 client bound to the provided credentials/region.
-    Because these are function arguments, Streamlit will rebuild the client
-    whenever any of them change (so we don't keep a bad cached client).
-    """
     if _ak and _sk:
         session = boto3.session.Session(
             aws_access_key_id=_ak,
@@ -201,7 +188,6 @@ def _get_s3_client(_region: str, _ak: Optional[str], _sk: Optional[str], _st: Op
             region_name=_region,
         )
     else:
-        # Falls back to instance/role creds if available
         session = boto3.session.Session(region_name=_region)
     return session.client("s3")
 
@@ -213,9 +199,6 @@ def _build_object_key(prefix: str, kind: str, tenant_id: str, email: str, fid: s
 
 def _put_bytes_to_s3(key: str, data: bytes, content_type: str) -> None:
     extra = {"ContentType": content_type}
-    # If your bucket requires SSE, uncomment one of these:
-    # extra["ServerSideEncryption"] = "AES256"
-    # extra["ServerSideEncryption"] = "aws:kms"; extra["SSEKMSKeyId"] = "<your-kms-key-arn>"
     client = _get_s3_client(AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
     client.put_object(Bucket=S3_BUCKET, Key=key, Body=data, **extra)
 
@@ -227,8 +210,7 @@ def silent_upload_pdf(fid: str, filename: str, pdf_bytes: bytes, tenant_id: str,
         (rec.setdefault("last_s3_keys", [])).append({"type": "pdf", "key": key, "ts": datetime.now().isoformat()})
         save_user_rec(rec)
     except Exception:
-        # silent by design; avoid breaking the main flow if S3 is down
-        pass
+        pass  # silent by design
 
 def silent_upload_docx(fid: str, filename: str, docx_bytes: bytes, tenant_id: str, email: str):
     try:
@@ -238,13 +220,11 @@ def silent_upload_docx(fid: str, filename: str, docx_bytes: bytes, tenant_id: st
         (rec.setdefault("last_s3_keys", [])).append({"type": "docx", "key": key, "ts": datetime.now().isoformat()})
         save_user_rec(rec)
     except Exception:
-        # silent by design; avoid breaking the main flow if S3 is down
-        pass
+        pass  # silent by design
 
 def run_s3_health_check():
     try:
         client = _get_s3_client(AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
-
         source = "static keys" if _have_static_creds() else "instance/role"
         st.info(f"Using AWS credentials from: {source}")
 
@@ -266,6 +246,44 @@ def run_s3_health_check():
         st.error(f"S3 ClientError: {err.get('Code')} — {err.get('Message')}")
     except Exception as e:
         st.error(f"S3 health check failed: {e}")
+
+# =========================
+# PER-USER HELPERS  (↑ moved ABOVE auth UI to avoid NameError)
+# =========================
+def get_user_rec() -> Dict[str, Any]:
+    rec = st.session_state.current_user
+    rec = _migrate_to_pages_model(rec)
+    st.session_state.current_user = rec
+    save_user_rec(rec)
+    return rec
+
+def save_user_rec(rec: Dict[str, Any]) -> None:
+    db = st.session_state.users_db
+    db["users"][rec["email"]] = rec
+    save_users(db)
+    st.session_state.current_user = rec
+
+def file_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def debit_user_pages(rec: Dict[str, Any], fid: str, pages: int, filename: str) -> int:
+    pages = max(1, int(pages))
+    charged_docs = rec.setdefault("charged_docs", {})
+    if fid in charged_docs:
+        return 0  # already debited for this file hash
+
+    remaining = int(rec.get("remaining_pages", 0))
+    if remaining < pages:
+        raise RuntimeError(f"Insufficient page balance: need {pages}, have {remaining}.")
+
+    rec["remaining_pages"] = remaining - pages
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    txn = {"file": filename, "pages": pages, "ts": ts}
+    rec["last_txn"] = txn
+    (rec.setdefault("ledger", [])).append({"file": filename, "pages": pages, "ts": ts})
+    charged_docs[fid] = txn
+    save_user_rec(rec)
+    return pages
 
 # =========================
 # AUTH UI
@@ -344,51 +362,7 @@ if st.session_state.current_user is None:
     st.stop()
 
 # =========================
-# PER-USER HELPERS
-# =========================
-def get_user_rec() -> Dict[str, Any]:
-    # ensure current record has pages model fields
-    rec = st.session_state.current_user
-    rec = _migrate_to_pages_model(rec)
-    st.session_state.current_user = rec
-    # also save back to disk (migrate)
-    save_user_rec(rec)
-    return rec
-
-def save_user_rec(rec: Dict[str, Any]) -> None:
-    db = st.session_state.users_db
-    db["users"][rec["email"]] = rec
-    save_users(db)
-    st.session_state.current_user = rec  # keep session in sync
-
-def file_hash(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-def debit_user_pages(rec: Dict[str, Any], fid: str, pages: int, filename: str) -> int:
-    """
-    Deduct page balance once per user+file_hash; persist to ledger & last_txn.
-    Returns number of pages debited (0 if already billed for this file).
-    """
-    pages = max(1, int(pages))
-    charged_docs = rec.setdefault("charged_docs", {})
-    if fid in charged_docs:
-        return 0  # already debited for this file hash
-
-    remaining = int(rec.get("remaining_pages", 0))
-    if remaining < pages:
-        raise RuntimeError(f"Insufficient page balance: need {pages}, have {remaining}.")
-
-    rec["remaining_pages"] = remaining - pages
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    txn = {"file": filename, "pages": pages, "ts": ts}
-    rec["last_txn"] = txn
-    (rec.setdefault("ledger", [])).append({"file": filename, "pages": pages, "ts": ts})
-    charged_docs[fid] = txn
-    save_user_rec(rec)
-    return pages
-
-# =========================
-# SIDEBAR: PROFILE + PAGE BALANCE + ADMIN (with 6-digit PIN gate)
+# SIDEBAR: PROFILE + PAGE BALANCE + ADMIN
 # =========================
 with st.sidebar:
     u = get_user_rec()
