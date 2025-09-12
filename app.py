@@ -17,9 +17,14 @@ from docx.shared import Pt
 
 
 # Hide Streamlit header and footer
-
-
-
+# Hide Streamlit header and footer
+hide_streamlit_style = """
+    <style>
+    header {visibility: hidden;}
+    footer {visibility: hidden;}
+    </style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 # =========================
 # PAGE SETUP
